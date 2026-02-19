@@ -20,14 +20,26 @@
 
 const preprocessor = require('./preprocessor');
 const cache = require('./cache');
+const crypto = require('crypto');
+const axios = require('axios');
+const { createLogger } = require('../utils/logger');
+const reliabilityTelemetry = require('./reliability.telemetry');
+
+const logger = createLogger('SummarizationService');
 
 // Configuration
 const CONFIG = {
   maxHistoryItems: 50,
   maxSummaryLength: 500,
+  maxLlmPromptChars: 4000,
+  llmTimeoutMs: 2500,
   cachePrefix: 'summary:',
+  llmCachePrefix: 'summary:llm:',
   cacheTtlMs: 60 * 60 * 1000,  // 1 hour
-  versionPrefix: 'v:'
+  llmCacheTtlMs: 6 * 60 * 60 * 1000,
+  versionPrefix: 'v:',
+  llmEnabled: process.env.SUMMARIZATION_LLM_ENABLED !== 'false',
+  llmConfidenceThreshold: Number(process.env.SUMMARIZATION_LLM_CONFIDENCE_THRESHOLD || 0.65)
 };
 
 // Status transition labels
@@ -40,10 +52,13 @@ const STATUS_LABELS = {
 
 // Action keywords for extraction
 const ACTION_KEYWORDS = {
-  inspection: ['inspected', 'visited', 'site visit', 'checked', 'verified', 'inspection'],
+  inspection: ['inspected', 'visited', 'site visit', 'checked', 'verified', 'inspection', 'surveyed'],
+  field_visit: ['field visit', 'on-site', 'onsite', 'spot visit', 'visited location'],
   assignment: ['assigned', 'forwarded', 'transferred', 'escalated', 'referred'],
-  work: ['work started', 'repair', 'fixed', 'completed', 'done', 'resolved'],
-  response: ['responded', 'replied', 'contacted', 'called', 'informed'],
+  work_order: ['work order', 'issued order', 'maintenance order', 'contractor assigned'],
+  work: ['work started', 'repair', 'fixed', 'completed', 'done', 'resolved', 'rectified'],
+  citizen_followup: ['citizen follow-up', 'followed up', 'citizen contacted', 'beneficiary contacted'],
+  response: ['responded', 'replied', 'contacted', 'called', 'informed', 'notified'],
   escalation: ['escalated', 'urgent', 'priority', 'supervisor', 'higher authority'],
   pending: ['pending', 'waiting', 'on hold', 'delayed', 'awaiting']
 };
@@ -125,11 +140,163 @@ const summarizeRemarks = (remarks, maxLength = 100) => {
   return summary;
 };
 
+const getChronologicalHistory = (history = []) => {
+  return [...history].sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+};
+
+const extractTimelineSignals = (complaint, history) => {
+  const sortedHistory = getChronologicalHistory(history);
+  const signals = {
+    createdDate: complaint.createdAt,
+    assignmentEvents: [],
+    escalationEvents: [],
+    updateEvents: [],
+    resolutionEvent: null
+  };
+
+  if (complaint.assignedTo) {
+    signals.assignmentEvents.push({
+      date: complaint.updatedAt || complaint.createdAt,
+      details: `Assigned to ${complaint.assignedTo}`
+    });
+  }
+
+  for (const item of sortedHistory) {
+    const actionType = extractActionType(item.remarks);
+    const update = {
+      date: item.createdAt,
+      status: item.status,
+      actionType,
+      remarks: summarizeRemarks(item.remarks, 120)
+    };
+
+    if (actionType === 'assignment') {
+      signals.assignmentEvents.push(update);
+    }
+
+    if (actionType === 'escalation') {
+      signals.escalationEvents.push(update);
+    }
+
+    signals.updateEvents.push(update);
+
+    if (item.status === 'resolved') {
+      signals.resolutionEvent = update;
+    }
+  }
+
+  return signals;
+};
+
+const calculateSummaryConfidence = (complaint, history, keyActions, timelineSignals) => {
+  let score = 0;
+
+  if (complaint?.description?.trim()) score += 0.2;
+  if (complaint?.category) score += 0.15;
+  if (complaint?.status) score += 0.15;
+  if (history.length > 0) score += 0.2;
+  if (keyActions.length > 0) score += 0.15;
+  if (timelineSignals.updateEvents.length > 0) score += 0.1;
+  if (complaint?.adminRemarks?.trim()) score += 0.05;
+
+  const normalized = Math.min(1, Math.max(0, score));
+  const level = normalized >= 0.8 ? 'high' : normalized >= 0.6 ? 'medium' : 'low';
+
+  return {
+    score: Number(normalized.toFixed(2)),
+    level,
+    hasEnoughContext: normalized >= 0.6
+  };
+};
+
+const derivePendingSteps = (complaint, statusSummary, keyActions) => {
+  if (complaint.status === 'resolved') {
+    return ['Close the complaint after citizen confirmation.'];
+  }
+
+  if (complaint.status === 'rejected') {
+    return ['Provide a clear rejection reason and reopen path to citizen if applicable.'];
+  }
+
+  const steps = [];
+  const actionTypes = new Set(keyActions.map(action => action.type));
+
+  if (!actionTypes.has('inspection') && !actionTypes.has('field_visit')) {
+    steps.push('Conduct or record an on-site inspection.');
+  }
+
+  if (!actionTypes.has('work_order') && !actionTypes.has('work')) {
+    steps.push('Issue work order and assign execution owner.');
+  }
+
+  if (!actionTypes.has('citizen_followup') && !actionTypes.has('response')) {
+    steps.push('Send citizen follow-up with progress update.');
+  }
+
+  if (statusSummary.isOverdue) {
+    steps.push('Escalate to higher authority due to overdue timeline.');
+  }
+
+  if (steps.length === 0) {
+    steps.push('Continue active monitoring until closure criteria are met.');
+  }
+
+  return steps;
+};
+
+const tryEnhanceWithGemini = async (cacheKey, prompt) => {
+  const geminiApiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY;
+
+  if (!CONFIG.llmEnabled || !geminiApiKey) {
+    return null;
+  }
+
+  const llmCache = cache.getCache('summaries_llm');
+  const fullCacheKey = `${CONFIG.llmCachePrefix}${cacheKey}`;
+  const cached = await llmCache.get(fullCacheKey);
+
+  if (cached?.textSummary) {
+    return { textSummary: cached.textSummary, fromCache: true };
+  }
+
+  try {
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiApiKey}`,
+      {
+        contents: [{ parts: [{ text: prompt.substring(0, CONFIG.maxLlmPromptChars) }] }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 220
+        }
+      },
+      { timeout: CONFIG.llmTimeoutMs }
+    );
+
+    const textSummary = response?.data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+    if (!textSummary) {
+      return null;
+    }
+
+    await llmCache.set(fullCacheKey, { textSummary }, {
+      l1TtlMs: CONFIG.llmCacheTtlMs,
+      l2TtlMs: CONFIG.llmCacheTtlMs
+    });
+
+    return { textSummary, fromCache: false };
+  } catch (error) {
+    logger.debug('Gemini enhancement unavailable, using local summary', {
+      message: error.message
+    });
+    return null;
+  }
+};
+
 /**
  * Build timeline from complaint history
  */
 const buildTimeline = (complaint, history) => {
   const timeline = [];
+  const sortedHistory = getChronologicalHistory(history);
 
   // Add creation event
   timeline.push({
@@ -144,9 +311,10 @@ const buildTimeline = (complaint, history) => {
   });
 
   // Add history events
-  history.forEach((item, index) => {
-    const prevStatus = index > 0 ? history[index - 1].status : 'pending';
+  sortedHistory.forEach((item, index) => {
+    const prevStatus = index > 0 ? sortedHistory[index - 1].status : 'pending';
     const statusChanged = item.status !== prevStatus;
+    const actionType = extractActionType(item.remarks);
 
     timeline.push({
       date: item.createdAt,
@@ -156,12 +324,15 @@ const buildTimeline = (complaint, history) => {
       statusInfo: STATUS_LABELS[item.status] || STATUS_LABELS.pending,
       action: statusChanged
         ? `Status changed to ${STATUS_LABELS[item.status]?.label || item.status}`
-        : extractActionType(item.remarks),
+        : actionType,
+      actionType,
       details: summarizeRemarks(item.remarks),
       adminId: item.adminId,
       isStatusChange: statusChanged
     });
   });
+
+  timeline.sort((a, b) => new Date(a.date) - new Date(b.date));
 
   // Mark last item
   if (timeline.length > 0) {
@@ -177,9 +348,10 @@ const buildTimeline = (complaint, history) => {
 const extractKeyActions = (history) => {
   const keyActions = [];
   const seenTypes = new Set();
+  const sortedHistory = getChronologicalHistory(history);
 
   // Prioritize status changes and unique action types
-  history.forEach(item => {
+  sortedHistory.forEach(item => {
     const actionType = extractActionType(item.remarks);
 
     // Always include status changes
@@ -201,6 +373,16 @@ const extractKeyActions = (history) => {
         formattedDate: formatDate(item.createdAt)
       });
       seenTypes.add('resolved');
+    }
+
+    if (item.status === 'rejected' && !seenTypes.has('rejected')) {
+      keyActions.push({
+        type: 'rejected',
+        label: 'Issue Rejected',
+        date: item.createdAt,
+        formattedDate: formatDate(item.createdAt)
+      });
+      seenTypes.add('rejected');
     }
 
     // Add unique action types
@@ -228,6 +410,7 @@ const extractKeyActions = (history) => {
 const generateStatusSummary = (complaint, history) => {
   const currentStatus = complaint.status;
   const statusInfo = STATUS_LABELS[currentStatus] || STATUS_LABELS.pending;
+  const sortedHistory = getChronologicalHistory(history);
 
   // Calculate durations
   const totalDuration = calculateDuration(complaint.createdAt,
@@ -243,8 +426,8 @@ const generateStatusSummary = (complaint, history) => {
     : totalDuration;
 
   // Get latest update
-  const latestUpdate = history.length > 0
-    ? history[history.length - 1]
+  const latestUpdate = sortedHistory.length > 0
+    ? sortedHistory[sortedHistory.length - 1]
     : null;
 
   // Build summary
@@ -259,6 +442,7 @@ const generateStatusSummary = (complaint, history) => {
     lastUpdated: latestUpdate?.createdAt || complaint.createdAt,
     lastUpdatedFormatted: formatDate(latestUpdate?.createdAt || complaint.createdAt),
     latestRemarks: latestUpdate?.remarks || null,
+    assignedTo: complaint.assignedTo || null,
     isOverdue: false,
     overdueBy: null
   };
@@ -282,20 +466,20 @@ const generateStatusSummary = (complaint, history) => {
 /**
  * Generate full text summary
  */
-const generateTextSummary = (complaint, history, timeline, keyActions, statusSummary) => {
+const generateTextSummary = (complaint, history, timeline, keyActions, statusSummary, contextSummary) => {
   const parts = [];
 
   // Opening
-  parts.push(`Complaint "${complaint.title}" was submitted ${formatDate(complaint.createdAt)}.`);
+  parts.push(`Issue: "${complaint.title}" (${complaint.category}) reported ${formatDate(complaint.createdAt)}.`);
 
-  // Category and priority
-  parts.push(`Category: ${complaint.category}. Priority: ${complaint.priority || 'Normal'}.`);
+  // Context
+  parts.push(`Priority is ${complaint.priority || 'normal'} and current status is ${statusSummary.statusLabel}.`);
 
-  // Progress
+  // What has been done
   if (history.length === 0) {
-    parts.push('No updates have been recorded yet.');
+    parts.push('No administrative updates have been recorded yet.');
   } else {
-    parts.push(`${history.length} update${history.length > 1 ? 's' : ''} recorded.`);
+    parts.push(`${history.length} update${history.length > 1 ? 's' : ''} recorded so far.`);
   }
 
   // Key actions
@@ -303,12 +487,11 @@ const generateTextSummary = (complaint, history, timeline, keyActions, statusSum
     const actionsSummary = keyActions
       .map(a => `${a.label} (${a.formattedDate})`)
       .join(', ');
-    parts.push(`Key actions: ${actionsSummary}.`);
+    parts.push(`Actions completed: ${actionsSummary}.`);
   }
 
-  // Current status
-  parts.push(`Current status: ${statusSummary.statusLabel}.`);
-  parts.push(`Total time: ${statusSummary.totalDuration}.`);
+  // Current status and elapsed time
+  parts.push(`Current position: ${statusSummary.statusLabel}, active for ${statusSummary.timeInStatus}, total elapsed ${statusSummary.totalDuration}.`);
 
   // Overdue warning
   if (statusSummary.isOverdue) {
@@ -320,6 +503,10 @@ const generateTextSummary = (complaint, history, timeline, keyActions, statusSum
     parts.push(`Latest update: "${summarizeRemarks(statusSummary.latestRemarks, 100)}"`);
   }
 
+  if (contextSummary.pendingSteps.length > 0) {
+    parts.push(`Next steps: ${contextSummary.pendingSteps.join(' ')}`);
+  }
+
   return parts.join(' ');
 };
 
@@ -328,15 +515,29 @@ const generateTextSummary = (complaint, history, timeline, keyActions, statusSum
  * Used to determine if summary needs regeneration
  */
 const calculateVersionHash = (complaint, history) => {
+  const sortedHistory = getChronologicalHistory(history);
+  const historySignature = sortedHistory.map(item => ({
+    id: item._id,
+    status: item.status,
+    remarks: item.remarks || '',
+    createdAt: item.createdAt?.toISOString ? item.createdAt.toISOString() : String(item.createdAt || '')
+  }));
+
   const versionData = {
     status: complaint.status,
-    historyCount: history.length,
-    lastHistoryId: history.length > 0 ? history[history.length - 1]._id : null,
+    assignedTo: complaint.assignedTo || null,
+    adminRemarks: complaint.adminRemarks || null,
+    resolvedAt: complaint.resolvedAt?.toISOString() || null,
+    historyCount: sortedHistory.length,
+    lastHistoryId: sortedHistory.length > 0 ? sortedHistory[sortedHistory.length - 1]._id : null,
+    timelineSignature: historySignature,
     updatedAt: complaint.updatedAt?.toISOString() || complaint.createdAt?.toISOString()
   };
 
-  // Simple hash
-  return Buffer.from(JSON.stringify(versionData)).toString('base64').slice(0, 20);
+  return crypto.createHash('sha256')
+    .update(JSON.stringify(versionData))
+    .digest('hex')
+    .slice(0, 24);
 };
 
 /**
@@ -353,6 +554,8 @@ const summarizeComplaint = async (complaintId, options = {}) => {
     includeTimeline = true,
     includeKeyActions = true,
     includeTextSummary = true,
+    includeConfidence = true,
+    allowLlmEnhancement = true,
     forceRegenerate = false
   } = options;
 
@@ -366,6 +569,9 @@ const summarizeComplaint = async (complaintId, options = {}) => {
     timeline: null,
     keyActions: null,
     statusSummary: null,
+    contextSummary: null,
+    confidence: null,
+    summarySource: 'local',
     textSummary: null,
     error: null
   };
@@ -387,6 +593,7 @@ const summarizeComplaint = async (complaintId, options = {}) => {
       .sort({ createdAt: 1 })
       .limit(CONFIG.maxHistoryItems)
       .lean();
+    const sortedHistory = getChronologicalHistory(history);
 
     // Calculate version hash
     result.versionHash = calculateVersionHash(complaint, history);
@@ -398,11 +605,21 @@ const summarizeComplaint = async (complaintId, options = {}) => {
       const cached = await summaryCache.get(cacheKey);
 
       if (cached && cached.versionHash === result.versionHash) {
-        return {
+        const cachedResult = {
           ...cached,
           fromCache: true,
           latencyMs: Date.now() - startTime
         };
+
+        reliabilityTelemetry.recordSummarization({
+          latencyMs: cachedResult.latencyMs,
+          fromCache: true,
+          summarySource: cachedResult.summarySource,
+          confidenceScore: cachedResult.confidence?.score,
+          error: cachedResult.error
+        });
+
+        return cachedResult;
       }
     }
 
@@ -421,26 +638,77 @@ const summarizeComplaint = async (complaintId, options = {}) => {
 
     // Generate timeline
     if (includeTimeline) {
-      result.timeline = buildTimeline(complaint, history);
+      result.timeline = buildTimeline(complaint, sortedHistory);
     }
 
     // Extract key actions
     if (includeKeyActions) {
-      result.keyActions = extractKeyActions(history);
+      result.keyActions = extractKeyActions(sortedHistory);
     }
 
     // Generate status summary
-    result.statusSummary = generateStatusSummary(complaint, history);
+    result.statusSummary = generateStatusSummary(complaint, sortedHistory);
+
+    const timelineSignals = extractTimelineSignals(complaint, sortedHistory);
+    const keyActions = result.keyActions || [];
+    const pendingSteps = derivePendingSteps(complaint, result.statusSummary, keyActions);
+
+    result.contextSummary = {
+      issue: complaint.description ? summarizeRemarks(complaint.description, 180) : complaint.title,
+      category: complaint.category,
+      keyActions,
+      latestStatus: result.statusSummary.statusLabel,
+      timeElapsed: result.statusSummary.totalDuration,
+      pendingSteps,
+      timelineSignals
+    };
+
+    if (includeConfidence) {
+      result.confidence = calculateSummaryConfidence(
+        complaint,
+        sortedHistory,
+        keyActions,
+        timelineSignals
+      );
+    }
 
     // Generate text summary
     if (includeTextSummary) {
       result.textSummary = generateTextSummary(
         complaint,
-        history,
+        sortedHistory,
         result.timeline,
         result.keyActions,
-        result.statusSummary
+        result.statusSummary,
+        result.contextSummary
       );
+
+      const shouldUseLlm = allowLlmEnhancement &&
+        includeConfidence &&
+        (result.confidence?.score || 0) < CONFIG.llmConfidenceThreshold;
+
+      if (shouldUseLlm) {
+        const llmPrompt = [
+          'Create a concise civic complaint summary answering:',
+          '1) What is the issue?',
+          '2) What has been done?',
+          '3) What is current status?',
+          '4) What happens next?',
+          `Title: ${complaint.title}`,
+          `Category: ${complaint.category}`,
+          `Description: ${complaint.description || ''}`,
+          `Status: ${result.statusSummary.statusLabel}`,
+          `Time elapsed: ${result.statusSummary.totalDuration}`,
+          `Recent updates: ${sortedHistory.slice(-5).map(item => `${formatDate(item.createdAt)} - ${item.status} - ${(item.remarks || '').trim()}`).join(' | ')}`,
+          `Pending steps: ${pendingSteps.join(' ')}`
+        ].join('\n');
+
+        const llmEnhanced = await tryEnhanceWithGemini(result.versionHash, llmPrompt);
+        if (llmEnhanced?.textSummary) {
+          result.textSummary = summarizeRemarks(llmEnhanced.textSummary, CONFIG.maxSummaryLength);
+          result.summarySource = llmEnhanced.fromCache ? 'gemini_cache' : 'gemini';
+        }
+      }
     }
 
     result.latencyMs = Date.now() - startTime;
@@ -450,10 +718,26 @@ const summarizeComplaint = async (complaintId, options = {}) => {
     const cacheKey = `${CONFIG.cachePrefix}${complaintId}`;
     await summaryCache.set(cacheKey, result, { l1TtlMs: CONFIG.cacheTtlMs });
 
+    reliabilityTelemetry.recordSummarization({
+      latencyMs: result.latencyMs,
+      fromCache: false,
+      summarySource: result.summarySource,
+      confidenceScore: result.confidence?.score,
+      error: null
+    });
+
   } catch (error) {
     result.error = error.message;
     result.generated = false;
     result.latencyMs = Date.now() - startTime;
+
+    reliabilityTelemetry.recordSummarization({
+      latencyMs: result.latencyMs,
+      fromCache: false,
+      summarySource: 'local',
+      confidenceScore: result.confidence?.score,
+      error: result.error
+    });
   }
 
   return result;
@@ -515,6 +799,8 @@ module.exports = {
   generateTextSummary,
   invalidateSummary,
   getSummarizationStats,
+  getReliabilitySnapshot: () => reliabilityTelemetry.getSnapshot(),
+  resetReliabilitySnapshot: () => reliabilityTelemetry.reset(),
   // Export for testing
   CONFIG,
   STATUS_LABELS,

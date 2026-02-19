@@ -16,6 +16,30 @@
 
 const mongoose = require('mongoose');
 
+const ERROR_LOG_COOLDOWN_MS = 60 * 1000;
+const errorLogState = new Map();
+
+const logCacheError = (namespace, operation, message) => {
+  const key = `${namespace}:${operation}`;
+  const now = Date.now();
+  const state = errorLogState.get(key) || { lastLoggedAt: 0, suppressed: 0 };
+
+  if (now - state.lastLoggedAt >= ERROR_LOG_COOLDOWN_MS) {
+    const suffix = state.suppressed > 0
+      ? ` (suppressed ${state.suppressed} similar errors in last ${ERROR_LOG_COOLDOWN_MS / 1000}s)`
+      : '';
+
+    console.error(`MongoCache ${operation} error [${namespace}]: ${message}${suffix}`);
+    errorLogState.set(key, { lastLoggedAt: now, suppressed: 0 });
+    return;
+  }
+
+  errorLogState.set(key, {
+    lastLoggedAt: state.lastLoggedAt,
+    suppressed: state.suppressed + 1
+  });
+};
+
 // Generic cache schema
 const CacheEntrySchema = new mongoose.Schema({
   _id: {
@@ -122,7 +146,7 @@ class MongoCache {
       return entry.value;
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache get error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'get', error.message);
       return null;
     }
   }
@@ -160,7 +184,7 @@ class MongoCache {
       this.stats.sets++;
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache set error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'set', error.message);
     }
   }
 
@@ -174,7 +198,7 @@ class MongoCache {
       await CacheEntry.findByIdAndDelete(fullKey);
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache delete error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'delete', error.message);
     }
   }
 
@@ -205,7 +229,7 @@ class MongoCache {
       await CacheEntry.deleteMany({ namespace: this.namespace });
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache clear error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'clear', error.message);
     }
   }
 
@@ -261,7 +285,7 @@ class MongoCache {
       return result;
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache mget error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'mget', error.message);
       return {};
     }
   }
@@ -300,7 +324,7 @@ class MongoCache {
       this.stats.sets += Object.keys(items).length;
     } catch (error) {
       this.stats.errors++;
-      console.error(`MongoCache mset error [${this.namespace}]:`, error.message);
+      logCacheError(this.namespace, 'mset', error.message);
     }
   }
 }

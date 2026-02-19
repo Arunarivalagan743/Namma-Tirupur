@@ -844,6 +844,9 @@ const getComplaintSummary = async (req, res) => {
         timeline: summary.timeline,
         keyActions: summary.keyActions,
         statusSummary: summary.statusSummary,
+        contextSummary: summary.contextSummary,
+        confidence: summary.confidence,
+        summarySource: summary.summarySource,
         textSummary: summary.textSummary,
         fromCache: summary.fromCache,
         latencyMs: summary.latencyMs

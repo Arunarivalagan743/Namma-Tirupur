@@ -19,6 +19,13 @@ try {
   console.warn('AI services not available:', err.message);
 }
 
+let reliabilityTelemetry = null;
+try {
+  reliabilityTelemetry = require('../ai/reliability.telemetry');
+} catch (err) {
+  console.warn('AI reliability telemetry not available:', err.message);
+}
+
 /**
  * GET /api/admin/ai/overview
  * Get AI system health and overview
@@ -2039,6 +2046,40 @@ const getPhase5Overview = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/admin/ai/reliability
+ * Get reliability telemetry snapshot for translation and summarization
+ */
+const getAIReliability = async (req, res) => {
+  try {
+    if (!reliabilityTelemetry) {
+      return res.status(503).json({ error: 'Reliability telemetry not available' });
+    }
+
+    const telemetry = reliabilityTelemetry.getSnapshot();
+
+    let translationCacheStats = null;
+    if (aiServices?.translationCache?.getCacheStats) {
+      try {
+        translationCacheStats = await aiServices.translationCache.getCacheStats();
+      } catch (e) {
+        translationCacheStats = { error: e.message };
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        telemetry,
+        translationCache: translationCacheStats
+      }
+    });
+  } catch (error) {
+    console.error('AI reliability error:', error);
+    res.status(500).json({ error: 'Failed to fetch AI reliability snapshot' });
+  }
+};
+
 module.exports = {
   // Phase 1
   getAIOverview,
@@ -2120,6 +2161,7 @@ module.exports = {
   getEdgeCases,
   runTestSuite,
   runStressTest,
-  getPhase5Overview
+  getPhase5Overview,
+  getAIReliability
 };
 

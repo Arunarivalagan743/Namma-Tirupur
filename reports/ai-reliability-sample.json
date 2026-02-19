@@ -1,0 +1,304 @@
+{
+  "suite": "ai-reliability",
+  "status": "pass",
+  "startedAt": "2026-02-14T10:47:30.367Z",
+  "finishedAt": "2026-02-14T10:47:31.003Z",
+  "config": {
+    "batchSize": 120,
+    "uniquePool": 24,
+    "concurrency": 30,
+    "dryRun": false,
+    "baseline": null
+  },
+  "assertions": {
+    "total": 12,
+    "passed": 12,
+    "failed": 0,
+    "details": [
+      {
+        "pass": true,
+        "message": "Fallback returns original text on API failure",
+        "details": {
+          "success": true,
+          "translatedText": "Repeated forbidden text",
+          "sourceLanguage": "en",
+          "targetLanguage": "ta",
+          "cached": false,
+          "untranslated": true,
+          "failureCached": false,
+          "latencyMs": 2
+        }
+      },
+      {
+        "pass": true,
+        "message": "Failed translation is cached and prevents repeated API calls",
+        "details": {
+          "apiCalls": 1
+        }
+      },
+      {
+        "pass": true,
+        "message": "Translation succeeds after retries when transient errors recover",
+        "details": {
+          "success": true,
+          "translatedText": "[ta] Retry test text",
+          "sourceLanguage": "en",
+          "targetLanguage": "ta",
+          "cached": false,
+          "untranslated": false,
+          "failureCached": false,
+          "latencyMs": 602
+        }
+      },
+      {
+        "pass": true,
+        "message": "Retry policy performs max 2 retries (3 total attempts)",
+        "details": {
+          "apiCalls": 3
+        }
+      },
+      {
+        "pass": true,
+        "message": "In-flight deduplication prevents duplicate concurrent API calls",
+        "details": {
+          "apiCalls": 1,
+          "concurrency": 30
+        }
+      },
+      {
+        "pass": true,
+        "message": "Batch grouping translates only unique texts",
+        "details": {
+          "apiCalls": 24,
+          "expected": 24,
+          "chunks": 3,
+          "statuses": [
+            200,
+            200,
+            200
+          ]
+        }
+      },
+      {
+        "pass": true,
+        "message": "Warm cache batch avoids external translation calls",
+        "details": {
+          "apiCalls": 0
+        }
+      },
+      {
+        "pass": true,
+        "message": "Warm cache has lower or equal latency versus cold cache",
+        "details": {
+          "warmLatencyMs": 1,
+          "coldLatencyMs": 2
+        }
+      },
+      {
+        "pass": true,
+        "message": "Summary quality covers mandatory fields for dataset: short",
+        "details": {
+          "checks": {
+            "hasIssue": true,
+            "hasActions": true,
+            "hasCurrentStatus": true,
+            "hasNextStep": true
+          },
+          "score": 1
+        }
+      },
+      {
+        "pass": true,
+        "message": "Summary quality covers mandatory fields for dataset: long-history",
+        "details": {
+          "checks": {
+            "hasIssue": true,
+            "hasActions": true,
+            "hasCurrentStatus": true,
+            "hasNextStep": true
+          },
+          "score": 1
+        }
+      },
+      {
+        "pass": true,
+        "message": "Summary quality covers mandatory fields for dataset: status-updates",
+        "details": {
+          "checks": {
+            "hasIssue": true,
+            "hasActions": true,
+            "hasCurrentStatus": true,
+            "hasNextStep": true
+          },
+          "score": 1
+        }
+      },
+      {
+        "pass": true,
+        "message": "Summary quality covers mandatory fields for dataset: edge-missing",
+        "details": {
+          "checks": {
+            "hasIssue": true,
+            "hasActions": true,
+            "hasCurrentStatus": true,
+            "hasNextStep": true
+          },
+          "score": 1
+        }
+      }
+    ]
+  },
+  "translation": {
+    "failureScenario": {
+      "first": {
+        "statusCode": 200,
+        "payload": {
+          "success": true,
+          "translatedText": "Repeated forbidden text",
+          "sourceLanguage": "en",
+          "targetLanguage": "ta",
+          "cached": false,
+          "untranslated": true,
+          "failureCached": false,
+          "latencyMs": 2
+        }
+      },
+      "second": {
+        "statusCode": 200,
+        "payload": {
+          "success": true,
+          "translatedText": "Repeated forbidden text",
+          "sourceLanguage": "en",
+          "targetLanguage": "ta",
+          "cached": true,
+          "untranslated": true,
+          "failureCached": true,
+          "latencyMs": 0
+        }
+      },
+      "apiCalls": 1
+    },
+    "retryScenario": {
+      "result": {
+        "statusCode": 200,
+        "payload": {
+          "success": true,
+          "translatedText": "[ta] Retry test text",
+          "sourceLanguage": "en",
+          "targetLanguage": "ta",
+          "cached": false,
+          "untranslated": false,
+          "failureCached": false,
+          "latencyMs": 602
+        }
+      },
+      "apiCalls": 3
+    },
+    "dedupeScenario": {
+      "apiCalls": 1
+    },
+    "coldRun": {
+      "apiCalls": 24,
+      "latencyMs": 2
+    },
+    "warmRun": {
+      "apiCalls": 0,
+      "latencyMs": 1
+    }
+  },
+  "summarization": {
+    "averageQualityScore": 1,
+    "qualityScores": [
+      1,
+      1,
+      1,
+      1
+    ]
+  },
+  "metrics": {
+    "translation": {
+      "avgLatencyMs": 1.5,
+      "p95LatencyMs": 2,
+      "samples": 2
+    },
+    "summarization": {
+      "avgLatencyMs": 0.5,
+      "p95LatencyMs": 1,
+      "averageQualityScore": 1,
+      "samples": 4
+    },
+    "telemetry": {
+      "startedAt": "2026-02-14T10:47:30.367Z",
+      "generatedAt": "2026-02-14T10:47:31.003Z",
+      "thresholds": {
+        "errorRate": 0.05,
+        "cacheHitRate": 0.7,
+        "latencyMs": 200,
+        "retryRate": 0.2,
+        "confidence": 0.6
+      },
+      "translation": {
+        "totalRequests": 39,
+        "totalItems": 273,
+        "latencyMsTotal": 1287,
+        "apiCalls": 29,
+        "cacheHits": 112,
+        "failureCacheHits": 1,
+        "retries": 2,
+        "errors": 1,
+        "fallbackCount": 0,
+        "deduped": 29,
+        "queueOverflow": 0,
+        "aborted403": 1,
+        "avgLatencyMs": 33,
+        "errorRate": 0.0256,
+        "cacheHitRate": 0.4139,
+        "retryRate": 0.069,
+        "fallbackRate": 0
+      },
+      "summarization": {
+        "totalRequests": 4,
+        "latencyMsTotal": 2,
+        "errors": 0,
+        "cacheHits": 0,
+        "geminiUsage": 0,
+        "localUsage": 4,
+        "lowConfidenceCount": 0,
+        "confidenceTotal": 4,
+        "confidenceSamples": 4,
+        "avgLatencyMs": 0.5,
+        "errorRate": 0,
+        "cacheHitRate": 0,
+        "geminiUsageRate": 0,
+        "avgConfidence": 1
+      },
+      "alerts": [
+        {
+          "metric": "translation.errorRate",
+          "message": "Translation error rate above threshold",
+          "value": 1,
+          "threshold": 0.05,
+          "level": "warning",
+          "timestamp": "2026-02-14T10:47:30.370Z"
+        },
+        {
+          "metric": "translation.avgLatencyMs",
+          "message": "Translation latency threshold exceeded",
+          "value": 200.6667,
+          "threshold": 200,
+          "level": "warning",
+          "timestamp": "2026-02-14T10:47:30.972Z"
+        },
+        {
+          "metric": "translation.cacheHitRate",
+          "message": "Translation cache hit rate below threshold",
+          "value": 0.05,
+          "threshold": 0.7,
+          "level": "warning",
+          "timestamp": "2026-02-14T10:47:30.996Z"
+        }
+      ]
+    }
+  },
+  "regressions": []
+}

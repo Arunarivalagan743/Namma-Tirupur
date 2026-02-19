@@ -125,6 +125,7 @@ router.get('/ai/quality/health', aiAdminController.getQualityHealth);
 router.get('/ai/quality/trends', aiAdminController.getAccuracyTrends);
 router.get('/ai/quality/errors', aiAdminController.getErrorAnalysis);
 router.get('/ai/quality/report', aiAdminController.generateQualityReport);
+router.get('/ai/reliability', aiAdminController.getAIReliability);
 
 // Feedback
 router.post('/ai/feedback', aiAdminController.submitFeedback);

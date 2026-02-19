@@ -12,9 +12,16 @@
 
 const crypto = require('crypto');
 const { translationCache } = require('./cache');
+const { createLogger } = require('../utils/logger');
 
 // Get the pre-configured translation cache
 const cache = translationCache();
+const logger = createLogger('TranslationCache');
+
+const CONFIG = {
+  failureTtlMs: 6 * 60 * 60 * 1000,
+  debug: process.env.TRANSLATION_DEBUG === 'true'
+};
 
 /**
  * Generate a unique cache key for a translation request
@@ -35,20 +42,69 @@ const generateCacheKey = (text, sourceLang, targetLang) => {
  * @param {string} targetLang - Target language code
  * @returns {Promise<string|null>} - Cached translation or null
  */
-const getCachedTranslation = async (text, sourceLang = 'en', targetLang) => {
+const normalizeCacheEntry = (cached, originalText) => {
+  if (!cached) {
+    return null;
+  }
+
+  if (typeof cached === 'string') {
+    return {
+      translatedText: cached,
+      untranslated: false,
+      failure: false,
+      cachedAt: null,
+      source: 'legacy'
+    };
+  }
+
+  if (typeof cached === 'object' && typeof cached.translatedText === 'string') {
+    return {
+      translatedText: cached.translatedText,
+      untranslated: !!cached.untranslated,
+      failure: !!cached.failure,
+      errorCode: cached.errorCode,
+      reason: cached.reason,
+      cachedAt: cached.cachedAt || null,
+      source: 'structured'
+    };
+  }
+
+  return {
+    translatedText: originalText,
+    untranslated: true,
+    failure: true,
+    reason: 'invalid_cache_payload',
+    cachedAt: null,
+    source: 'invalid'
+  };
+};
+
+const getCachedEntry = async (text, sourceLang = 'en', targetLang) => {
   try {
     const key = generateCacheKey(text, sourceLang, targetLang);
     const cached = await cache.get(key);
+    return normalizeCacheEntry(cached, text);
+  } catch (error) {
+    logger.warn('Translation cache get failed', { message: error.message });
+    return null;
+  }
+};
 
-    if (cached) {
-      console.log(`📚 Translation cache HIT [${targetLang}]: "${text.substring(0, 30)}..."`);
-      return cached;
+const getCachedTranslation = async (text, sourceLang = 'en', targetLang) => {
+  try {
+    const entry = await getCachedEntry(text, sourceLang, targetLang);
+
+    if (!entry || entry.failure || entry.untranslated) {
+      return null;
     }
 
-    console.log(`📭 Translation cache MISS [${targetLang}]: "${text.substring(0, 30)}..."`);
-    return null;
+    if (CONFIG.debug) {
+      logger.debug('Translation cache HIT', { targetLang });
+    }
+
+    return entry.translatedText;
   } catch (error) {
-    console.error('Translation cache get error:', error.message);
+    logger.warn('Translation cache get failed', { message: error.message });
     return null;
   }
 };
@@ -60,13 +116,55 @@ const getCachedTranslation = async (text, sourceLang = 'en', targetLang) => {
  * @param {string} targetLang - Target language code
  * @param {string} translatedText - Translated text
  */
-const cacheTranslation = async (text, sourceLang = 'en', targetLang, translatedText) => {
+const cacheTranslation = async (text, sourceLang = 'en', targetLang, translatedText, options = {}) => {
   try {
     const key = generateCacheKey(text, sourceLang, targetLang);
-    await cache.set(key, translatedText);
-    console.log(`💾 Translation cached [${targetLang}]: "${text.substring(0, 30)}..."`);
+    const payload = {
+      translatedText,
+      untranslated: false,
+      failure: false,
+      cachedAt: new Date().toISOString()
+    };
+    await cache.set(key, payload, {
+      l1TtlMs: options.ttlMs,
+      l2TtlMs: options.ttlMs
+    });
+
+    if (CONFIG.debug) {
+      logger.debug('Translation cached', { targetLang });
+    }
   } catch (error) {
-    console.error('Translation cache set error:', error.message);
+    logger.warn('Translation cache set failed', { message: error.message });
+  }
+};
+
+const cacheTranslationFailure = async (text, sourceLang = 'en', targetLang, errorMeta = {}, ttlMs = CONFIG.failureTtlMs) => {
+  try {
+    const key = generateCacheKey(text, sourceLang, targetLang);
+    const payload = {
+      translatedText: text,
+      untranslated: true,
+      failure: true,
+      errorCode: errorMeta.errorCode || null,
+      reason: errorMeta.reason || 'translation_failed',
+      cachedAt: new Date().toISOString(),
+      retryAfter: new Date(Date.now() + ttlMs).toISOString()
+    };
+
+    await cache.set(key, payload, {
+      l1TtlMs: ttlMs,
+      l2TtlMs: ttlMs
+    });
+
+    if (CONFIG.debug) {
+      logger.debug('Translation failure cached', {
+        targetLang,
+        errorCode: payload.errorCode,
+        reason: payload.reason
+      });
+    }
+  } catch (error) {
+    logger.warn('Translation failure cache set failed', { message: error.message });
   }
 };
 
@@ -86,18 +184,24 @@ const getOrTranslate = async (text, targetLang, translateFn, sourceLang = 'en') 
   }
 
   // Check cache first
-  const cached = await getCachedTranslation(text, sourceLang, targetLang);
-  if (cached) {
-    return cached;
+  const cachedEntry = await getCachedEntry(text, sourceLang, targetLang);
+  if (cachedEntry) {
+    return cachedEntry.translatedText;
   }
 
-  // Call translation function
-  const translated = await translateFn(text, targetLang, sourceLang);
+  try {
+    const translated = await translateFn(text, targetLang, sourceLang);
 
-  // Cache the result (async, non-blocking)
-  cacheTranslation(text, sourceLang, targetLang, translated).catch(() => {});
+    // Cache the result (async, non-blocking)
+    cacheTranslation(text, sourceLang, targetLang, translated).catch(() => {});
 
-  return translated;
+    return translated;
+  } catch (error) {
+    cacheTranslationFailure(text, sourceLang, targetLang, {
+      reason: error.message
+    }).catch(() => {});
+    return text;
+  }
 };
 
 /**
@@ -110,7 +214,9 @@ const batchCache = async (translations) => {
   );
 
   await Promise.allSettled(promises);
-  console.log(`💾 Batch cached ${translations.length} translations`);
+  if (CONFIG.debug) {
+    logger.debug('Batch translations cached', { count: translations.length });
+  }
 };
 
 /**
@@ -137,7 +243,9 @@ const clearCache = async (options = {}) => {
 module.exports = {
   generateCacheKey,
   getCachedTranslation,
+  getCachedEntry,
   cacheTranslation,
+  cacheTranslationFailure,
   getOrTranslate,
   batchCache,
   getCacheStats,
