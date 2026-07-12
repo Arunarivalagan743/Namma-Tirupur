@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # MongoDB Database Service
+  mongodb:
+    image: mongo:6.0
+    container_name: namsev-mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - namsev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Express Backend Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: namsev-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - NODE_ENV=development
+      - MONGODB_URI=mongodb://mongodb:27017/namsev_db
+      - FRONTEND_URL=http://localhost
+      # Pass Firebase and other variables as environment variables
+      # In production, these should be supplied via shell environment or .env file
+      - FIREBASE_PROJECT_ID=${FIREBASE_PROJECT_ID:-your-project-id}
+      - FIREBASE_PRIVATE_KEY=${FIREBASE_PRIVATE_KEY:-your-private-key}
+      - FIREBASE_CLIENT_EMAIL=${FIREBASE_CLIENT_EMAIL:-your-client-email}
+      - ADMIN_EMAIL=${ADMIN_EMAIL:-panchayat.office@gmail.com}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    networks:
+      - namsev-network
+    restart: unless-stopped
+
+  # Vite Frontend Service
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:5000/api
+        - VITE_FIREBASE_API_KEY=${VITE_FIREBASE_API_KEY:-your-api-key}
+        - VITE_FIREBASE_AUTH_DOMAIN=${VITE_FIREBASE_AUTH_DOMAIN:-your-project-id.firebaseapp.com}
+        - VITE_FIREBASE_PROJECT_ID=${VITE_FIREBASE_PROJECT_ID:-your-project-id}
+        - VITE_FIREBASE_STORAGE_BUCKET=${VITE_FIREBASE_STORAGE_BUCKET:-your-project-id.appspot.com}
+        - VITE_FIREBASE_MESSAGING_SENDER_ID=${VITE_FIREBASE_MESSAGING_SENDER_ID:-your-sender-id}
+        - VITE_FIREBASE_APP_ID=${VITE_FIREBASE_APP_ID:-your-app-id}
+        - VITE_ADMIN_EMAIL=${VITE_ADMIN_EMAIL:-panchayat.office@gmail.com}
+        - VITE_PANCHAYAT_NAME=${VITE_PANCHAYAT_NAME:-Your Panchayat Name}
+        - VITE_PANCHAYAT_CODE=${VITE_PANCHAYAT_CODE:-PNCH001}
+    container_name: namsev-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - namsev-network
+    restart: unless-stopped
+
+volumes:
+  mongo-data:
+    driver: local
+
+networks:
+  namsev-network:
+    driver: bridge

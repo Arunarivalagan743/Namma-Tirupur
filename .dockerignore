@@ -1,0 +1,15 @@
+# Docker Ignore
+.git
+.gitignore
+node_modules
+**/node_modules
+**/dist
+**/build
+.env
+**/.env
+.env.local
+firebase-service-account.json
+**/firebase-service-account.json
+docs
+README.md
+LICENSE
